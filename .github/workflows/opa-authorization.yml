@@ -1,0 +1,105 @@
+name: OPA PR Authorization
+
+# Centrally authorize pull requests targeting the protected `prod` branch.
+# The decision comes from OPA (policy + OPAL-synced data), never from the PR.
+on:
+  pull_request:
+    branches:
+      - prod
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+
+# Runs on a self-hosted runner installed on the SAME Azure VM as OPA, so the
+# workflow can reach OPA at localhost:8181 WITHOUT exposing it to the internet.
+# Security: do NOT use pull_request_target; do NOT checkout or run PR code.
+# This workflow only reads the GitHub event context and calls the OPA API.
+permissions:
+  contents: read
+
+jobs:
+  opa-pr-authorization:
+    runs-on: self-hosted
+    timeout-minutes: 5
+    steps:
+      - name: Authorize PR with OPA
+        shell: powershell
+        env:
+          OPA_URL: http://localhost:8181
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # --- Read the real PR identity from the GitHub event context. ---
+          # This payload is provided server-side by GitHub (not PR content).
+          $event = Get-Content -Raw -Path $env:GITHUB_EVENT_PATH | ConvertFrom-Json
+          $actor       = $event.pull_request.user.login   # PR author (authoritative)
+          $triggeredBy = $event.sender.login              # who triggered the run (context)
+          $repository  = $event.repository.full_name
+          $prNumber    = [int]$event.pull_request.number
+          $headBranch  = $event.pull_request.head.ref
+          $baseBranch  = $event.pull_request.base.ref
+
+          Write-Host "::notice::PR #$prNumber -> $repository"
+          Write-Host "::notice::PR author (actor): $actor"
+          Write-Host "::notice::Triggered by: $triggeredBy"
+          Write-Host "::notice::Source branch: $headBranch"
+          Write-Host "::notice::Target branch: $baseBranch"
+
+          # --- Build the authorization input. The role is NOT taken from the
+          #      PR or workflow; OPA looks it up from synchronized policy data. ---
+          $bodyObj = @{
+            input = @{
+              actor       = $actor
+              repository  = $repository
+              base_branch = $baseBranch
+              action      = 'pull_request'
+              pr_number   = $prNumber
+              head_branch = $headBranch
+            }
+          }
+          $body = $bodyObj | ConvertTo-Json -Compress -Depth 10
+
+          Write-Host "::group::OPA request body"
+          Write-Host $body
+          Write-Host "::endgroup::"
+
+          # --- Call OPA. Unreachable OPA => fail the check (deny-by-default). ---
+          $decisionPath = '/v1/data/iam/github/pr'
+          $uri = "$env:OPA_URL$decisionPath"
+          try {
+            $response = Invoke-RestMethod -Uri $uri -Method Post -ContentType 'application/json' -Body $body -ErrorAction Stop
+          } catch {
+            Write-Host "::error::OPA unavailable at $uri"
+            Write-Host "::error::$($_.Exception.Message)"
+            Write-Host "::error::Authorization FAILED (deny-by-default): OPA unreachable."
+            exit 1
+          }
+
+          Write-Host "::group::OPA response"
+          $response | ConvertTo-Json -Depth 10
+          Write-Host "::endgroup::"
+
+          # --- Parse the real OPA response. ---
+          $decision = $response.result
+          if ($null -eq $decision) {
+            Write-Host "::error::Malformed OPA response: no 'result' field."
+            exit 1
+          }
+
+          $allow  = [bool]$decision.allow
+          $reason = $decision.reason
+          $role   = $decision.role
+
+          Write-Host "::notice::Resolved role (from OPA data): $role"
+          Write-Host "::notice::Decision: allow = $allow"
+          Write-Host "::notice::Reason: $reason"
+
+          # --- Pass only when OPA returns ALLOW. DENY / malformed => fail. ---
+          if ($allow -eq $true) {
+            Write-Host "::notice::OPA authorization PASSED: $reason"
+          } else {
+            Write-Host "::error::OPA authorization DENIED: $reason"
+            exit 1
+          }
